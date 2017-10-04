@@ -62,7 +62,9 @@ class ModelConfig(Config):
                  lexical_bias: bool = False,
                  learn_lexical_bias: bool = False,
                  weight_tying: bool = False,
-                 weight_tying_type: Optional[str] = C.WEIGHT_TYING_TRG_SOFTMAX) -> None:
+                 weight_tying_type: Optional[str] = C.WEIGHT_TYING_TRG_SOFTMAX,
+                 scheduled_sampling_type: Optional[str] = None,
+                 scheduled_sampling_params: Optional[list] = None) -> None:
         super().__init__()
         self.config_data = config_data
         self.max_seq_len_source = max_seq_len_source
@@ -78,6 +80,10 @@ class ModelConfig(Config):
         if weight_tying and weight_tying_type is None:
             raise RuntimeError("weight_tying_type must be specified when using weight_tying.")
         self.weight_tying_type = weight_tying_type
+        self.scheduled_sampling_type = scheduled_sampling_type
+        self.scheduled_sampling_params = scheduled_sampling_params
+        if scheduled_sampling_type and scheduled_sampling_params is None:
+            raise RuntimeError("scheduled sampling decay parameters must be specified when using scheduled sampling.")
 
 
 class SockeyeModel:

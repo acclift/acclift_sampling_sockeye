@@ -394,7 +394,9 @@ def create_decoder_config(args: argparse.Namespace, vocab_target_size: int) -> C
             state_init=args.rnn_decoder_state_init,
             context_gating=args.rnn_context_gating,
             layer_normalization=args.layer_normalization,
-            attention_in_upper_layers=args.attention_in_upper_layers)
+            attention_in_upper_layers=args.attention_in_upper_layers,
+            scheduled_sampling_type=args.scheduled_sampling_type,
+            scheduled_sampling_params=args.scheduled_sampling_params)
 
     return config_decoder
 

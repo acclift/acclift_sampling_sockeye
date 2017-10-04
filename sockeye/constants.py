@@ -196,6 +196,8 @@ LR_SCHEDULERS = [LR_SCHEDULER_FIXED_RATE_INV_SQRT_T,
                  LR_SCHEDULER_FIXED_RATE_INV_T,
                  LR_SCHEDULER_FIXED_STEP,
                  LR_SCHEDULER_PLATEAU_REDUCE]
+# Scheduled sampling decay rates
+SAMPLING_SCHEDULES = ["linear-decay", "exponential-decay", "inv-sigmoid-decay"]
 
 OUTPUT_HANDLER_TRANSLATION = "translation"
 OUTPUT_HANDLER_TRANSLATION_WITH_ALIGNMENTS = "translation_with_alignments"

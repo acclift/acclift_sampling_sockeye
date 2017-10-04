@@ -46,6 +46,55 @@ def get_decoder(config: Config,
         raise ValueError("Unsupported decoder configuration")
 
 
+def check_scheduled_sampling_params(scheduled_sampling_type: str, scheduled_sampling_params: list) -> None:
+    if scheduled_sampling_type == 'inv-sigmoid-decay':
+        assert len(scheduled_sampling_params) == 1, \
+            ('The inverse sigmoid decaying option for scheduled sampling requires 1 parameter,'
+             ' but given {}').format(len(scheduled_sampling_params))
+
+        k = scheduled_sampling_params[0]
+        assert k >= 1, 'Offset should be greater than or equal to 1'
+
+    elif scheduled_sampling_type == 'exponential-decay':
+        assert len(scheduled_sampling_params) == 1, \
+            ('The exponential decaying option for scheduled sampling requires 1 parameter,'
+             ' but given {}').format(len(scheduled_sampling_params))
+
+        k = scheduled_sampling_params[0]
+        assert k < 1, 'Offset for the exponential decay should be less than 1.'
+
+    elif scheduled_sampling_type == 'linear-decay':
+        assert len(scheduled_sampling_params) == 3, \
+            ('The linear decaying option for scheduled sampling requires 3 parameters,'
+             ' but given {}').format(len(scheduled_sampling_params))
+
+        k, epsilon, slope = scheduled_sampling_params
+        assert k <= 1, 'Offset for the linear decay should be less than 1.'
+        assert epsilon >= 0, 'Epsilon for the linear decay should be greater than or equal to 0.'
+
+def get_sampling_scheduler(scheduled_sampling_type, scheduled_sampling_params):
+    """
+    Computes the threshold over which we train against model samples rather than gold targets
+    """
+    i = mx.sym.Variable('updates')
+
+    check_scheduled_sampling_params(scheduled_sampling_type, scheduled_sampling_params)
+
+    if scheduled_sampling_type == 'inv-sigmoid-decay':
+        k = scheduled_sampling_params[0]
+        sampling_scheduler = lambda: k / (k + mx.sym.exp(i / k) - 1)
+    elif scheduled_sampling_type == 'exponential-decay':
+        k = scheduled_sampling_params[0]
+        sampling_scheduler = lambda: pow(k, i)
+    elif scheduled_sampling_type == 'linear-decay':
+        k, epsilon, slope = scheduled_sampling_params
+        sampling_scheduler = lambda: mx.sym.clip(k - slope * i, epsilon, k)
+    else:
+        sampling_scheduler = lambda: 1
+
+    return sampling_scheduler
+
+
 class Decoder(ABC):
     """
     Generic decoder interface.
@@ -394,7 +443,9 @@ class RecurrentDecoderConfig(Config):
                  state_init: str = C.RNN_DEC_INIT_LAST,
                  context_gating: bool = False,
                  layer_normalization: bool = False,
-                 attention_in_upper_layers: bool = False) -> None:
+                 attention_in_upper_layers: bool = False,
+                 scheduled_sampling_type: Optional[str] = None,
+                 scheduled_sampling_params: Optional[list] = None) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.max_seq_len_source = max_seq_len_source
@@ -408,6 +459,8 @@ class RecurrentDecoderConfig(Config):
         self.context_gating = context_gating
         self.layer_normalization = layer_normalization
         self.attention_in_upper_layers = attention_in_upper_layers
+        self.scheduled_sampling_type = scheduled_sampling_type
+        self.scheduled_sampling_params = scheduled_sampling_params
 
 
 class RecurrentDecoder(Decoder):
@@ -486,6 +539,11 @@ class RecurrentDecoder(Decoder):
         else:
             self.cls_w = mx.sym.Variable("%scls_weight" % prefix)
         self.cls_b = mx.sym.Variable("%scls_bias" % prefix)
+
+        # Threshold for scheduled sampling
+        self._get_sampling_threshold = get_sampling_scheduler(self.config.scheduled_sampling_type, \
+                                                          self.config.scheduled_sampling_params)
+
 
     def _create_state_init_parameters(self):
         """
