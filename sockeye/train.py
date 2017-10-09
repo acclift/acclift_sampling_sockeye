@@ -476,7 +476,8 @@ def create_training_model(model_config: model.ModelConfig,
                           train_iter: data_io.ParallelBucketSentenceIter,
                           lr_scheduler_instance: lr_scheduler.LearningRateScheduler,
                           resume_training: bool,
-                          training_state_dir: str) -> training.TrainingModel:
+                          training_state_dir: str,
+                          state_names: List[str]) -> training.TrainingModel:
     """
     Create a training model and load the parameters from disk if needed.
 
@@ -487,6 +488,7 @@ def create_training_model(model_config: model.ModelConfig,
     :param lr_scheduler: The learning rate scheduler.
     :param resume_training: When True, the model will be loaded from disk.
     :param training_state_dir: Directory where the training state is stored.
+    :param state_names: names of states tracked in model
     :return: The training model.
     """
     training_model = training.TrainingModel(config=model_config,
@@ -494,7 +496,8 @@ def create_training_model(model_config: model.ModelConfig,
                                             train_iter=train_iter,
                                             fused=args.use_fused_rnn,
                                             bucketing=not args.no_bucketing,
-                                            lr_scheduler=lr_scheduler_instance)
+                                            lr_scheduler=lr_scheduler_instance,
+                                            state_names=state_names)
 
     # We may consider loading the params in TrainingModule, for consistency
     # with the training state saving
@@ -570,9 +573,10 @@ def main():
         model_config = create_model_config(args, vocab_source_size, vocab_target_size, config_data)
         model_config.freeze()
 
+        state_names = ['updates'] if args.scheduled_sampling_type is not None else []
         training_model = create_training_model(model_config, args,
                                                context, train_iter, lr_scheduler_instance,
-                                               resume_training, training_state_dir)
+                                               resume_training, training_state_dir, state_names)
 
         lexicon_array = lexicon.initialize_lexicon(args.lexical_bias,
                                                    vocab_source, vocab_target) if args.lexical_bias else None

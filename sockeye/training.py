@@ -71,6 +71,7 @@ class TrainingModel(model.SockeyeModel):
     :param bucketing: If True bucketing will be used, if False the computation graph will always be
             unrolled to the full length.
     :param lr_scheduler: The scheduler that lowers the learning rate during training.
+    :param state_names: names of training states, e.g., updates
     """
 
     def __init__(self,
@@ -79,11 +80,13 @@ class TrainingModel(model.SockeyeModel):
                  train_iter: data_io.ParallelBucketSentenceIter,
                  fused: bool,
                  bucketing: bool,
-                 lr_scheduler) -> None:
+                 lr_scheduler,
+                 state_names: Optional[List[str]]) -> None:
         super().__init__(config)
         self.context = context
         self.lr_scheduler = lr_scheduler
         self.bucketing = bucketing
+        self.state_names = state_names if state_names is not None else []
         self._build_model_components(fused)
         self.module = self._build_module(train_iter)
         self.training_monitor = None  # type: Optional[callback.TrainingMonitor]
@@ -117,16 +120,42 @@ class TrainingModel(model.SockeyeModel):
 
             source_lexicon = self.lexicon.lookup(source) if self.lexicon else None
 
-            logits = self.decoder.decode_sequence(source_encoded, source_encoded_length, source_encoded_seq_len, target,
+            if self.config.config_decoder.scheduled_sampling_type is not None:
+                # scheduled sampling
+                probs, threshold = self.decoder.iterative_decode(source_encoded, source_encoded_length, source_encoded_seq_len,
+                                                                target, target_seq_len, source_lexicon)
+
+                # one-hot representation of gold targets for manually computing cross-entropy with model's predicted distribution
+                cross_entropy = mx.sym.one_hot(indices=mx.sym.cast(data=labels, dtype='int32'),
+                                               depth=self.config.vocab_target_size)
+
+                # zero out pad symbols (0)
+                cross_entropy = mx.sym.where(labels, cross_entropy, mx.sym.zeros((0, self.config.vocab_target_size)))
+
+                # compute cross_entropy
+                cross_entropy = - mx.sym.log(data=probs + C.COMPUTE_LOG_PROB_EPSILON) * cross_entropy
+                cross_entropy = mx.sym.sum(data=cross_entropy, axis=1)
+
+                cross_entropy = mx.sym.MakeLoss(cross_entropy, name=C.CROSS_ENTROPY)
+
+                probs = mx.sym.BlockGrad(probs, name=C.SOFTMAX_NAME)
+                threshold = mx.sym.BlockGrad(threshold)
+
+                outputs = [cross_entropy, probs, threshold]
+
+            else:
+
+                logits = self.decoder.decode_sequence(source_encoded, source_encoded_length, source_encoded_seq_len, target,
                                                   target_length, target_seq_len, source_lexicon)
 
-            outputs = model_loss.get_loss(logits, labels)
+                outputs = model_loss.get_loss(logits, labels)
 
             return mx.sym.Group(outputs), data_names, label_names
 
         if self.bucketing:
             logger.info("Using bucketing. Default max_seq_len=%s", train_iter.default_bucket_key)
             return mx.mod.BucketingModule(sym_gen=sym_gen,
+                                          state_names=self.state_names,
                                           logger=logger,
                                           default_bucket_key=train_iter.default_bucket_key,
                                           context=self.context)
@@ -137,6 +166,7 @@ class TrainingModel(model.SockeyeModel):
             return mx.mod.Module(symbol=symbol,
                                  data_names=data_names,
                                  label_names=label_names,
+                                 state_names=self.state_names,
                                  logger=logger,
                                  context=self.context)
 
@@ -155,6 +185,12 @@ class TrainingModel(model.SockeyeModel):
             else:
                 raise ValueError("unknown metric name")
         return mx.metric.create(metrics)
+
+    def _set_states(self, state_names, values):
+        states = self.module.get_states(merge_multi_context=False)
+        for state_name, state, value in zip(state_names, states, values):
+            for state_per_dev in state:
+                state_per_dev[:] = value
 
     def fit(self,
             train_iter: data_io.ParallelBucketSentenceIter,
@@ -309,7 +345,7 @@ class TrainingModel(model.SockeyeModel):
             if mxmonitor is not None:
                 mxmonitor.tic()
 
-            self.module.forward_backward(batch)
+            self._compute_gradients(batch, train_state)
             self.module.update()
 
             if mxmonitor is not None:
@@ -539,6 +575,13 @@ class TrainingModel(model.SockeyeModel):
 
         # And our own state
         return self.load_state(os.path.join(directory, C.TRAINING_STATE_NAME))
+
+    def _compute_gradients(self, batch: mx.io.DataBatch, train_state):
+        if self.state_names is not None:
+            # update the internal state ('update') which is used for scheduled sampling
+            self._set_states(self.state_names, [train_state.updates])
+
+        self.module.forward_backward(batch)
 
 
 def cleanup_params_files(output_folder: str, max_to_keep: int, checkpoint: int, best_checkpoint: int):

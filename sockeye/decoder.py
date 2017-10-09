@@ -48,17 +48,18 @@ def get_decoder(config: Config,
 
 def check_scheduled_sampling_params(scheduled_sampling_type: str, scheduled_sampling_params: list) -> None:
     if scheduled_sampling_type == 'inv-sigmoid-decay':
-        assert len(scheduled_sampling_params) == 1, \
-            ('The inverse sigmoid decaying option for scheduled sampling requires 1 parameter,'
-             ' but given {}').format(len(scheduled_sampling_params))
+        assert len(scheduled_sampling_params) == 2, \
+            ('The inverse sigmoid decaying option for scheduled sampling requires 2 parameters,'
+             ' but given {}.').format(len(scheduled_sampling_params))
 
-        k = scheduled_sampling_params[0]
-        assert k >= 1, 'Offset should be greater than or equal to 1'
+        k, lower_bound = scheduled_sampling_params
+        assert k >= 1, 'Offset should be greater than or equal to 1.'
+        assert lower_bound >= 0 and lower_bound < 1, 'Lower bound should be 0 or greater and less than 1.'
 
     elif scheduled_sampling_type == 'exponential-decay':
         assert len(scheduled_sampling_params) == 1, \
             ('The exponential decaying option for scheduled sampling requires 1 parameter,'
-             ' but given {}').format(len(scheduled_sampling_params))
+             ' but given {}.').format(len(scheduled_sampling_params))
 
         k = scheduled_sampling_params[0]
         assert k < 1, 'Offset for the exponential decay should be less than 1.'
@@ -81,8 +82,8 @@ def get_sampling_scheduler(scheduled_sampling_type, scheduled_sampling_params):
     check_scheduled_sampling_params(scheduled_sampling_type, scheduled_sampling_params)
 
     if scheduled_sampling_type == 'inv-sigmoid-decay':
-        k = scheduled_sampling_params[0]
-        sampling_scheduler = lambda: k / (k + mx.sym.exp(i / k) - 1)
+        k, lower_bound = scheduled_sampling_params
+        sampling_scheduler = lambda: k / (k + mx.sym.exp(i / k) - 1) * (1 - lower_bound) + lower_bound
     elif scheduled_sampling_type == 'exponential-decay':
         k = scheduled_sampling_params[0]
         sampling_scheduler = lambda: pow(k, i)
@@ -297,6 +298,7 @@ class TransformerDecoder(Decoder):
         logits = mx.sym.FullyConnected(data=target, num_hidden=self.config.vocab_size,
                                        weight=self.cls_w, bias=self.cls_b, name=C.LOGITS_NAME)
         return logits
+
 
     def decode_step(self,
                     target: mx.sym.Symbol,
@@ -541,7 +543,7 @@ class RecurrentDecoder(Decoder):
         self.cls_b = mx.sym.Variable("%scls_bias" % prefix)
 
         # Threshold for scheduled sampling
-        self._get_sampling_threshold = get_sampling_scheduler(self.config.scheduled_sampling_type, \
+        self._get_sampling_threshold = get_sampling_scheduler(self.config.scheduled_sampling_type,
                                                           self.config.scheduled_sampling_params)
 
 
@@ -558,8 +560,8 @@ class RecurrentDecoder(Decoder):
             self.init_bs.append(mx.sym.Variable("%senc2decinit_%d_bias" % (self.prefix, state_idx)))
             if self.config.layer_normalization:
                 self.init_norms.append(layers.LayerNormalization(num_hidden=init_num_hidden,
-                                                                 prefix="%senc2decinit_%d_norm" % (
-                                                                     self.prefix, state_idx)))
+                                                                 prefix="%senc2decinit_%d_norm" %
+                                                                        (self.prefix, state_idx)))
 
     def decode_sequence(self,
                         source_encoded: mx.sym.Symbol,
@@ -645,6 +647,100 @@ class RecurrentDecoder(Decoder):
                                           name='%s_plus_lex_bias' % C.LOGITS_NAME)
 
         return logits
+
+    def iterative_decode(self,
+                        source_encoded: mx.sym.Symbol,
+                        source_encoded_lengths: mx.sym.Symbol,
+                        source_encoded_max_length: int,
+                        target: mx.sym.Symbol,
+                        target_max_length: int,
+                        updates: mx.sym.Variable,
+                        source_lexicon: Optional[mx.sym.Symbol] = None) -> mx.sym.Symbol:
+        # TODO (acclift) see if we can factor this into a loop that reuses decode_step, not separate function
+
+        """
+                Decodes given a known target sequence and returns logits
+                with batch size and target length dimensions collapsed.
+                Used for training.
+                Iteratively loops over target side making each target prediction separately,
+                for use with scheduled sampling.
+
+                :param source_encoded: Encoded source: (source_encoded_max_length, batch_size, encoder_depth).
+                :param source_encoded_lengths: Lengths of encoded source sequences. Shape: (batch_size,).
+                :param source_encoded_max_length: Size of encoder time dimension.
+                :param target: Target sequence. Shape: (batch_size, target_max_length).
+                :param target_max_length: Size of target sequence dimension.
+                :param source_lexicon: Lexical biases for current sentence.
+                       Shape: (batch_size, target_vocab_size, source_seq_len)
+                :return: Logits of next-word predictions for target sequence.
+                         Shape: (batch_size * target_max_length, target_vocab_size)
+                """
+
+        # get recurrent attention function conditioned on source
+        source_encoded_batch_major = mx.sym.swapaxes(source_encoded, dim1=0, dim2=1, name='source_encoded_batch_major')
+        attention_func = self.attention.on(source_encoded_batch_major, source_encoded_lengths,
+                                           source_encoded_max_length)
+        attention_state = self.attention.get_initial_state(source_encoded_lengths, source_encoded_max_length)
+
+        # slice target words
+        # target: target_seq_len * (batch_size)
+        target = mx.sym.split(data=target, num_outputs=target_max_length, axis=1, squeeze_axis=True)
+
+        # initialize decoder states
+        # hidden: (batch_size, rnn_num_hidden)
+        # layer_states: List[(batch_size, state_num_hidden]
+        state = self.get_initial_state(source_encoded, source_encoded_lengths)
+
+        # probs_all: target_seq_len * (batch_size, target_vocab_size)
+        probs_all = []
+
+        # TODO: does it make sense to use lexical biases with sampling? if the model will use them, shouldn't this?
+
+        self.reset()
+
+        threshold = self._get_sampling_threshold()
+
+        for seq_idx in range(target_max_length):
+
+
+            if seq_idx == 0:
+                decoder_current_word = target[seq_idx]
+            else:
+                # generate a new random value at each timestep so we're not deciding to sampling over entire sequence
+                rand_val = mx.sym.random_uniform(low=0, high=1.0, shape=1)[0]
+                # choose between using gold target or sample from model as decoder history
+                # based on whether rand_val > threshold
+                # threshold decreases over time according to sampling schedule
+                # TO-DO (acclift): try using approximated argmax sampling here instead
+                decoder_current_word = mx.sym.where(rand_val < threshold,
+                                                    mx.sym.cast(target[seq_idx], dtype='int32'), sampled_words)
+
+            target_embed, _, _ = self.embedding.encode(decoder_current_word, None, 1)
+            state, attention_state = self._step(target_embed,
+                                                state,
+                                                attention_func,
+                                                attention_state,
+                                                seq_idx)
+
+            # (batch_size, target_vocab_size)
+            logit = mx.sym.FullyConnected(data=state.hidden, num_hidden=self.config.vocab_size,
+                                          weight=self.cls_w, bias=self.cls_b, name=C.LOGITS_NAME)
+
+            prob = mx.sym.softmax(logit)
+
+            sampled_words = mx.sym.sample_multinomial(prob)
+            sampled_words = mx.sym.BlockGrad(sampled_words)
+
+            probs_all.append(prob)
+
+        # probs: (batch_size, target_seq_len, target_vocab_size)
+        probs = mx.sym.concat(*probs_all, dim=1, name='probs')
+        # probs: (batch_size * target_seq_len, target_vocab_size)
+        probs = mx.sym.reshape(data=probs, shape=(-1, self.config.vocab_size))
+
+        return [probs, threshold]
+
+
 
     def decode_step(self,
                     target: mx.sym.Symbol,
