@@ -16,11 +16,28 @@ Defines commandline arguments for the main CLIs with reasonable defaults.
 """
 import argparse
 import sys
+import os
 from typing import Callable, Optional
 
 from sockeye.lr_scheduler import LearningRateSchedulerFixedStep
 from . import constants as C
 from . import data_io
+
+def regular_file() -> Callable:
+    """
+    Returns a method that can be used in argument parsing to check the argument is a regular file or a symbolic link,
+    but not, e.g., a process substitution.
+
+    :return: A method that can be used as a type in argparse.
+    """
+
+    def check_regular_file(value_to_check):
+        value_to_check = str(value_to_check)
+        if not os.path.isfile(value_to_check):
+            raise argparse.ArgumentTypeError("must exist and be a regular file.")
+        return value_to_check
+
+    return check_regular_file
 
 
 def int_greater_or_equal(threshold: int) -> Callable:
@@ -52,8 +69,42 @@ def learning_schedule() -> Callable:
         try:
             schedule = LearningRateSchedulerFixedStep.parse_schedule_str(schedule_str)
         except ValueError:
-            raise argparse.ArgumentTypeError("Learning rate schedule string should have form rate1:num_updates1[,rate2:num_updates2,...]")
+            raise argparse.ArgumentTypeError(
+                "Learning rate schedule string should have form rate1:num_updates1[,rate2:num_updates2,...]")
         return schedule
+
+    return parse
+
+
+def simple_dict() -> Callable:
+    """
+    A simple dictionary format that does not require spaces or quoting.
+
+    Supported types: bool, int, float
+
+    :return: A method that can be used as a type in argparse.
+    """
+
+    def parse(dict_str: str):
+
+        def _parse(value: str):
+            if value == "True":
+                return True
+            if value == "False":
+                return False
+            if "." in value:
+                return float(value)
+            return int(value)
+
+        _dict = dict()
+        try:
+            for entry in dict_str.split(","):
+                key, value = entry.split(":")
+                _dict[key] = _parse(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError("Specify argument dictionary as key1:value1,key2:value2,..."
+                                             " Supported types: bool, int, float.")
+        return _dict
 
     return parse
 
@@ -92,11 +143,13 @@ def file_or_stdin() -> Callable:
     """
     Returns a file descriptor from stdin or opening a file from a given path.
     """
+
     def parse(path):
         if path is None or path == "-":
             return sys.stdin
         else:
             return data_io.smart_open(path)
+
     return parse
 
 
@@ -133,16 +186,24 @@ def add_io_args(params):
 
     data_params.add_argument('--source', '-s',
                              required=True,
+                             type=regular_file(),
                              help='Source side of parallel training data.')
     data_params.add_argument('--target', '-t',
                              required=True,
+                             type=regular_file(),
                              help='Target side of parallel training data.')
+    data_params.add_argument('--limit',
+                             default=None,
+                             type=int,
+                             help="Maximum number of training sequences to read. Default: %(default)s.")
 
     data_params.add_argument('--validation-source', '-vs',
                              required=True,
+                             type=regular_file(),
                              help='Source side of validation data.')
     data_params.add_argument('--validation-target', '-vt',
                              required=True,
+                             type=regular_file(),
                              help='Target side of validation data.')
 
     data_params.add_argument('--output', '-o',
@@ -275,6 +336,25 @@ def add_model_parameters(params):
                               help="Add positional encodings to final segment embeddings for"
                                    " ConvolutionalEmbeddingEncoder. Default: %(default)s.")
 
+    # convolutional encoder/decoder arguments arguments
+    model_params.add_argument('--cnn-kernel-width',
+                              type=multiple_values(num_values=2, greater_or_equal=1, data_type=int),
+                              default=(3, 5),
+                              help='Kernel width of the convolutional encoder and decoder. Default: %(default)s.')
+    model_params.add_argument('--cnn-num-hidden',
+                              type=int_greater_or_equal(1),
+                              default=512,
+                              help='Number of hidden units for the convolutional encoder and decoder. '
+                                   'Default: %(default)s.')
+    model_params.add_argument('--cnn-activation-type',
+                              choices=C.CNN_ACTIVATION_TYPES,
+                              default=C.GLU,
+                              help="Type activation to use for each convolutional layer. Default: %(default)s.")
+    model_params.add_argument('--cnn-positional-embedding-type',
+                              choices=C.POSITIONAL_EMBEDDING_TYPES,
+                              default=C.LEARNED_POSITIONAL_EMBEDDING,
+                              help='The type of positional embedding. Default: %(default)s.')
+
     # rnn arguments
     model_params.add_argument('--rnn-cell-type',
                               choices=C.CELL_TYPES,
@@ -318,9 +398,10 @@ def add_model_parameters(params):
                               default=2048,
                               help='Number of hidden units in feed forward layers when using transformer. '
                                    'Default: %(default)s.')
-    model_params.add_argument('--transformer-no-positional-encodings',
-                              action='store_true',
-                              help='Do not use positional encodings.')
+    model_params.add_argument('--transformer-positional-embedding-type',
+                              choices=C.POSITIONAL_EMBEDDING_TYPES,
+                              default=C.FIXED_POSITIONAL_EMBEDDING,
+                              help='The type of positional embedding. Default: %(default)s.')
     model_params.add_argument('--transformer-preprocess',
                               type=multiple_values(num_values=2, greater_or_equal=None, data_type=str),
                               default=('', ''),
@@ -350,34 +431,34 @@ def add_model_parameters(params):
                                    'Use "x:x" to specify separate values for src&tgt. Default: %(default)s.')
 
     # attention arguments
-    model_params.add_argument('--attention-type',
+    model_params.add_argument('--rnn-attention-type',
                               choices=C.ATT_TYPES,
                               default=C.ATT_MLP,
                               help='Attention model for RNN decoders. Choices: {%(choices)s}. '
                                    'Default: %(default)s.')
-    model_params.add_argument('--attention-num-hidden',
+    model_params.add_argument('--rnn-attention-num-hidden',
                               default=None,
                               type=int,
                               help='Number of hidden units for attention layers. Default: equal to --rnn-num-hidden.')
-    model_params.add_argument('--attention-use-prev-word', action="store_true",
+    model_params.add_argument('--rnn-attention-use-prev-word', action="store_true",
                               help="Feed the previous target embedding into the attention mechanism.")
 
-    model_params.add_argument('--attention-coverage-type',
+    model_params.add_argument('--rnn-attention-coverage-type',
                               choices=["tanh", "sigmoid", "relu", "softrelu", "gru", "count"],
                               default="count",
                               help="Type of model for updating coverage vectors. 'count' refers to an update method"
                                    "that accumulates attention scores. 'tanh', 'sigmoid', 'relu', 'softrelu' "
                                    "use non-linear layers with the respective activation type, and 'gru' uses a"
                                    "GRU to update the coverage vectors. Default: %(default)s.")
-    model_params.add_argument('--attention-coverage-num-hidden',
+    model_params.add_argument('--rnn-attention-coverage-num-hidden',
                               type=int,
                               default=1,
                               help="Number of hidden units for coverage vectors. Default: %(default)s.")
-    model_params.add_argument('--attention-in-upper-layers',
+    model_params.add_argument('--rnn-attention-in-upper-layers',
                               action="store_true",
                               help="Pass the attention to the upper layers of the RNN decoder, similar "
                                    "to GNMT paper. Only applicable if more than one layer is used.")
-    model_params.add_argument('--attention-mhdot-heads',
+    model_params.add_argument('--rnn-attention-mhdot-heads',
                               type=int, default=None,
                               help='Number of heads for Multi-head dot attention. Default: %(default)s.')
 
@@ -412,10 +493,14 @@ def add_model_parameters(params):
     model_params.add_argument('--layer-normalization', action="store_true",
                               help="Adds layer normalization before non-linear activations. "
                                    "This includes MLP attention, RNN decoder state initialization, "
-                                   "RNN decoder hidden state, transformer layers."
+                                   "RNN decoder hidden state, and cnn layers."
                                    "It does not normalize RNN cell activations "
                                    "(this can be done using the '%s' or '%s' rnn-cell-type." % (C.LNLSTM_TYPE,
                                                                                                 C.LNGLSTM_TYPE))
+
+    model_params.add_argument('--weight-normalization', action="store_true",
+                              help="Adds weight normalization to decoder output layers "
+                                   "(and all convolutional weight matrices for CNN decoders). Default: %(default)s.")
 
 
 def add_training_args(params):
@@ -431,6 +516,7 @@ def add_training_args(params):
                               choices=[C.BATCH_TYPE_SENTENCE, C.BATCH_TYPE_WORD],
                               help="Sentence: each batch contains X sentences, number of words varies. Word: each batch"
                                    " contains (approximately) X words, number of sentences varies. Default: %(default)s.")
+
     train_params.add_argument('--fill-up',
                               type=str,
                               default='replicate',
@@ -445,17 +531,17 @@ def add_training_args(params):
 
     train_params.add_argument('--loss',
                               default=C.CROSS_ENTROPY,
-                              choices=[C.CROSS_ENTROPY, C.SMOOTHED_CROSS_ENTROPY],
+                              choices=[C.CROSS_ENTROPY],
                               help='Loss to optimize. Default: %(default)s.')
-    train_params.add_argument('--smoothed-cross-entropy-alpha',
-                              default=0.3,
+    train_params.add_argument('--label-smoothing',
+                              default=0.0,
                               type=float,
-                              help='Smoothing value for smoothed-cross-entropy loss. Default: %(default)s.')
-    train_params.add_argument('--normalize-loss',
-                              default=False,
-                              action="store_true",
-                              help='If turned on we normalize the loss by dividing by the number of non-PAD tokens.'
-                                   'If turned off the loss is only normalized by the number of sentences in a batch.')
+                              help='Smoothing constant for label smoothing. Default: %(default)s.')
+    train_params.add_argument('--loss-normalization-type',
+                              default=C.LOSS_NORM_VALID,
+                              choices=[C.LOSS_NORM_VALID, C.LOSS_NORM_BATCH],
+                              help='How to normalize the loss. By default we normalize by the number '
+                                   'of valid/non-PAD tokens (%s)' % C.LOSS_NORM_VALID)
 
     train_params.add_argument('--metrics',
                               nargs='+',
@@ -470,9 +556,8 @@ def add_training_args(params):
 
     train_params.add_argument('--max-updates',
                               type=int,
-                              default=-1,
-                              help='Maximum number of updates/batches to process. -1 for infinite. '
-                                   'Default: %(default)s.')
+                              default=None,
+                              help='Maximum number of updates/batches to process. Default: %(default)s.')
     train_params.add_argument('--checkpoint-frequency',
                               type=int_greater_or_equal(1),
                               default=1000,
@@ -485,8 +570,13 @@ def add_training_args(params):
                                    'Default: %(default)s')
     train_params.add_argument('--min-num-epochs',
                               type=int,
-                              default=0,
+                              default=None,
                               help='Minimum number of epochs (passes through the training data) '
+                                   'before fitting is stopped. Default: %(default)s.')
+    train_params.add_argument('--max-num-epochs',
+                              type=int,
+                              default=None,
+                              help='Maximum number of epochs (passes through the training data) '
                                    'before fitting is stopped. Default: %(default)s.')
 
     train_params.add_argument('--embed-dropout',
@@ -531,21 +621,49 @@ def add_training_args(params):
                               type=float,
                               default=.0,
                               help="Dropout probability for ConvolutionalEmbeddingEncoder. Default: %(default)s.")
+    train_params.add_argument('--cnn-hidden-dropout',
+                              type=float,
+                              default=.0,
+                              help="Dropout probability for dropout between convolutional layers. Default: %(default)s.")
 
     train_params.add_argument('--optimizer',
-                              default='adam',
-                              choices=['adam', 'sgd', 'rmsprop'],
+                              default=C.OPTIMIZER_ADAM,
+                              choices=C.OPTIMIZERS,
                               help='SGD update rule. Default: %(default)s.')
+    train_params.add_argument('--optimizer-params',
+                              type=simple_dict(),
+                              default=None,
+                              help='Additional optimizer params as dictionary. Format: key1:value1,key2:value2,...')
+
+    train_params.add_argument("--kvstore",
+                              type=str,
+                              default=C.KVSTORE_DEVICE,
+                              choices=C.KVSTORE_TYPES,
+                              help="The MXNet kvstore to use. 'device' is recommended for single process training. "
+                                   "Use any of 'dist_sync', 'dist_device_sync' and 'dist_async' for distributed "
+                                   "training. Default: %(default)s.")
+
     train_params.add_argument('--weight-init',
                               type=str,
                               default=C.INIT_XAVIER,
                               choices=C.INIT_TYPES,
-                              help='Type of weight initialization. Default: %(default)s.')
+                              help='Type of base weight initialization. Default: %(default)s.')
     train_params.add_argument('--weight-init-scale',
                               type=float,
-                              default=0.04,
-                              help='Weight initialization scale (currently only applies to uniform initialization). '
+                              default=2.34,
+                              help='Weight initialization scale. Applies to uniform (scale) and xavier (magnitude). '
                                    'Default: %(default)s.')
+    train_params.add_argument('--weight-init-xavier-factor-type',
+                              type=str,
+                              default='in',
+                              choices=['in', 'out', 'avg'],
+                              help='Xavier factor type. Default: %(default)s.')
+    train_params.add_argument('--embed-weight-init',
+                              type=str,
+                              default=C.EMBED_INIT_DEFAULT,
+                              choices=C.EMBED_INIT_TYPES,
+                              help='Type of embedding matrix weight initialization. If normal, initializes embedding '
+                                   'weights using a normal distribution with std=vocab_size. Default: %(default)s.')
     train_params.add_argument('--initial-learning-rate',
                               type=float,
                               default=0.0003,
@@ -582,8 +700,8 @@ def add_training_args(params):
                               type=learning_schedule(),
                               default=None,
                               help="For 'fixed-step' scheduler. Fully specified learning schedule in the form"
-                              " rate1:num_updates1[,rate2:num_updates2,...]. Overrides all other args related to"
-                              " learning rate and stopping conditions. Default: %(default)s.")
+                                   " rate1:num_updates1[,rate2:num_updates2,...]. Overrides all other args related to"
+                                   " learning rate and stopping conditions. Default: %(default)s.")
     train_params.add_argument('--learning-rate-half-life',
                               type=float,
                               default=10,
@@ -594,6 +712,16 @@ def add_training_args(params):
                               default=0,
                               help="Number of warmup steps. If set to x, linearly increases learning rate from 10%% "
                                    "to 100%% of the initial learning rate. Default: %(default)s.")
+    train_params.add_argument('--learning-rate-decay-param-reset',
+                              action='store_true',
+                              help='Resets model parameters to current best when learning rate is reduced due to the '
+                                   'value of --learning-rate-reduce-num-not-improved. Default: %(default)s.')
+    train_params.add_argument('--learning-rate-decay-optimizer-states-reset',
+                              choices=C.LR_DECAY_OPT_STATES_RESET_CHOICES,
+                              default=C.LR_DECAY_OPT_STATES_RESET_OFF,
+                              help="Action to take on optimizer states (e.g. Adam states) when learning rate is "
+                                   "reduced due to the value of --learning-rate-reduce-num-not-improved. "
+                                   "Default: %(default)s.")
 
     train_params.add_argument('--use-fused-rnn',
                               default=False,
@@ -676,6 +804,15 @@ def add_inference_args(params):
                                type=int_greater_or_equal(1),
                                default=5,
                                help='Size of the beam. Default: %(default)s.')
+    decode_params.add_argument('--batch-size',
+                               type=int_greater_or_equal(1),
+                               default=1,
+                               help='Batch size during decoding. Determines how many sentences are translated '
+                                    'simultaneously. Default: %(default)s.')
+    decode_params.add_argument('--chunk-size',
+                               type=int_greater_or_equal(1),
+                               default=1,
+                               help='Size of the chunks to be read from input at once. Default: %(default)s.')
     decode_params.add_argument('--ensemble-mode',
                                type=str,
                                default='linear',

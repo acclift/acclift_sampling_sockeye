@@ -22,6 +22,17 @@ from sockeye import __version__
 from sockeye import utils
 
 
+@pytest.mark.parametrize("some_list, expected", [
+    ([1, 2, 3, 4, 5, 6, 7, 8], [[1, 2, 3], [4, 5, 6], [7, 8]]),
+    ([1, 2], [[1, 2]]),
+    ([1, 2, 3], [[1, 2, 3]]),
+    ([1, 2, 3, 4], [[1, 2, 3], [4]]),
+])
+def test_chunks(some_list, expected):
+    chunk_size = 3
+    chunked_list = list(utils.chunks(some_list, chunk_size))
+    assert chunked_list == expected
+
 def test_get_alignments():
     attention_matrix = np.asarray([[0.1, 0.4, 0.5],
                                    [0.2, 0.8, 0.0],
@@ -166,14 +177,21 @@ def test_parse_version(version_string, expected_version):
 
 
 def test_check_version_disregards_minor():
-    utils.check_version("1.7.0")
+    release, major, minor = utils.parse_version(__version__)
+    other_minor_version = "%s.%s.%d" % (release, major, int(minor) + 1)
+    utils.check_version(other_minor_version)
+
+
+def _get_later_major_version():
+    release, major, minor = utils.parse_version(__version__)
+    return "%s.%d.%s" % (release, int(major) + 1, minor)
 
 
 def test_check_version_checks_major():
-    version = "1.8.1"
+    version = _get_later_major_version()
     with pytest.raises(utils.SockeyeError) as e:
         utils.check_version(version)
-    assert "Given major version (%s) does not match major code version (%s)" % (version, __version__)
+    assert "Given major version (%s) does not match major code version (%s)" % (version, __version__) == str(e.value)
 
 
 def test_average_arrays():
@@ -211,3 +229,37 @@ def test_save_and_load_params():
         assert "array" in loaded_aux_params
         assert np.isclose(loaded_arg_params['array'].asnumpy(), array.asnumpy()).all()
         assert np.isclose(loaded_aux_params['array'].asnumpy(), array.asnumpy()).all()
+
+
+def test_print_value():
+    data = mx.sym.Variable("data")
+    weights = mx.sym.Variable("weights")
+    softmax_label = mx.sym.Variable("softmax_label")
+
+    fc = mx.sym.FullyConnected(data=data, num_hidden=128, weight=weights, no_bias=True)
+    out = mx.sym.SoftmaxOutput(data=fc, label=softmax_label, name="softmax")
+
+    fc_print = mx.sym.Custom(op_type="PrintValue", data=fc, print_name="FullyConnected")
+    out_print = mx.sym.SoftmaxOutput(data=fc_print, label=softmax_label, name="softmax")
+
+    data_np = np.random.rand(1, 256)
+    weights_np = np.random.rand(128, 256)
+    label_np = np.random.rand(1, 128)
+
+    executor_base = out.simple_bind(mx.cpu(), data=(1, 256), softmax_label=(1, 128), weights=(128, 256))
+    executor_base.arg_dict["data"][:] = data_np
+    executor_base.arg_dict["weights"][:] = weights_np
+    executor_base.arg_dict["softmax_label"][:] = label_np
+
+    executor_print = out_print.simple_bind(mx.cpu(), data=(1, 256), softmax_label=(1, 128), weights=(128, 256))
+    executor_print.arg_dict["data"][:] = data_np
+    executor_print.arg_dict["weights"][:] = weights_np
+    executor_print.arg_dict["softmax_label"][:] = label_np
+
+    output_base = executor_base.forward(is_train=True)[0]
+    output_print = executor_print.forward(is_train=True)[0]
+    assert np.isclose(output_base.asnumpy(), output_print.asnumpy()).all()
+
+    executor_base.backward()
+    executor_print.backward()
+    assert np.isclose(executor_base.grad_arrays[1].asnumpy(), executor_print.grad_arrays[1].asnumpy()).all()

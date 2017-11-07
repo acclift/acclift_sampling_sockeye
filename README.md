@@ -4,16 +4,21 @@
 
 This package contains the Sockeye project,
 a sequence-to-sequence framework for Neural Machine Translation based on Apache MXNet Incubating.
-It implements the well-known encoder-decoder architecture with attention.
+It implements state-of-the-art encoder-decoder architectures, such as 
+- Deep Recurrent Neural Networks with Attention [[Bahdanau, '14](https://arxiv.org/abs/1409.0473)]
+- Transformer Models with self-attention [[Vaswani et al, '17](https://arxiv.org/abs/1706.03762)]
+- Fully convolutional sequence-to-sequence models [[Gehring et al, '17](https://arxiv.org/abs/1705.03122)]
 
 If you are interested in collaborating or have any questions, please submit a pull request or issue.
 You can also send questions to *sockeye-dev-at-amazon-dot-com*.
+
+Recent developments and changes are tracked in our [changelog](https://github.com/awslabs/sockeye/blob/master/CHANGELOG.md).
  
 ## Dependencies
 
 Sockeye requires:
 - **Python3**
-- [MXNet-0.10.0](https://github.com/dmlc/mxnet/tree/v0.10.0)
+- [MXNet-0.12.0](https://github.com/dmlc/mxnet/tree/v0.12.0)
 - numpy
 
 ## Installation
@@ -45,19 +50,13 @@ remaining instructions to work you will need to use `python3` instead of `python
 
 If you want to run sockeye on a GPU you need to make sure your version of Apache MXNet Incubating contains the GPU
 bindings.
-Depending on your version of CUDA you can do this by running the following for CUDA 8.0:
-
+Depending on your version of CUDA, you can do this by running the following:
 ```bash
-> wget https://raw.githubusercontent.com/awslabs/sockeye/master/requirements.gpu-cu80.txt
-> pip install sockeye --no-deps -r requirements.gpu-cu80.txt
-> rm requirements.gpu-cu80.txt
+> wget https://raw.githubusercontent.com/awslabs/sockeye/master/requirements.gpu-cu${CUDA_VERSION}.txt
+> pip install sockeye --no-deps -r requirements.gpu-cu${CUDA_VERSION}.txt
+> rm requirements.gpu-cu${CUDA_VERSION}.txt
 ```
-or the following for CUDA 7.5:
-```bash
-> wget https://raw.githubusercontent.com/awslabs/sockeye/master/requirements.gpu-cu75.txt
-> pip install sockeye --no-deps -r requirements.gpu-cu75.txt
-> rm requirements.gpu-cu75.txt
-```
+where `${CUDA_VERSION}` can be `75` (7.5), `80` (8.0), or `90` (9.0).
 
 ### Or: From Source
 
@@ -73,15 +72,12 @@ after cloning the repository from git.
 
 If you want to run sockeye on a GPU you need to make sure your version of Apache MXNet
 Incubating contains the GPU bindings. Depending on your version of CUDA you can do this by
-running the following for CUDA 8.0:
+running the following:
 
 ```bash
-> python setup.py install -r requirements.gpu-cu80.txt
+> python setup.py install -r requirements.gpu-cu${CUDA_VERSION}.txt
 ```
-or the following for CUDA 7.5:
-```bash
-> python setup.py install -r requirements.gpu-cu75.txt
-```
+where `${CUDA_VERSION}` can be `75` (7.5), `80` (8.0), or `90` (9.0).
 
 ### Optional dependencies
 In order to track learning curves during training you can optionally install dmlc's tensorboard fork
@@ -110,10 +106,11 @@ directly. For example *sockeye-train* can also be invoked as
 
 In order to train your first Neural Machine Translation model you will need two sets of parallel files: one for training 
 and one for validation. The latter will be used for computing various metrics during training. 
-Each set should consist of two files: one with source sentences and one with target sentences (translations). Both files should have the same number of lines, each line containing a single
+Each set should consist of two files: one with source sentences and one with target sentences (translations).
+Both files should have the same number of lines, each line containing a single
 sentence. Each sentence should be a whitespace delimited list of tokens.
 
-Say you wanted to train a German to English translation model, then you would call sockeye like this:
+Say you wanted to train a RNN German-to-English translation model, then you would call sockeye like this:
 ```bash
 > python -m sockeye.train --source sentences.de \
                        --target sentences.en \
@@ -124,7 +121,7 @@ Say you wanted to train a German to English translation model, then you would ca
 ```
 
 After training the directory *<model_dir>* will contain all model artifacts such as parameters and model 
-configuration. 
+configuration. The default setting is to train a 1-layer LSTM model with attention.
 
 
 ### Translate

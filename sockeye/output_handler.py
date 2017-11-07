@@ -16,8 +16,8 @@ import sys
 from typing import Optional
 
 import sockeye.constants as C
-import sockeye.data_io
-import sockeye.inference
+from . import data_io
+from . import inference
 from sockeye.utils import plot_attention, print_attention_text, get_alignments
 
 
@@ -32,9 +32,11 @@ def get_output_handler(output_type: str,
     :raises: ValueError for unknown output_type.
     :return: Output handler.
     """
-    output_stream = sys.stdout if output_fname is None else sockeye.data_io.smart_open(output_fname, mode='w')
+    output_stream = sys.stdout if output_fname is None else data_io.smart_open(output_fname, mode='w')
     if output_type == C.OUTPUT_HANDLER_TRANSLATION:
         return StringOutputHandler(output_stream)
+    elif output_type == C.OUTPUT_HANDLER_TRANSLATION_WITH_SCORE:
+        return StringWithScoreOutputHandler(output_stream)
     elif output_type == C.OUTPUT_HANDLER_TRANSLATION_WITH_ALIGNMENTS:
         return StringWithAlignmentsOutputHandler(output_stream, sure_align_threshold)
     elif output_type == C.OUTPUT_HANDLER_TRANSLATION_WITH_ALIGNMENT_MATRIX:
@@ -56,8 +58,8 @@ class OutputHandler(ABC):
 
     @abstractmethod
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -78,8 +80,8 @@ class StringOutputHandler(OutputHandler):
         self.stream = stream
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -87,6 +89,30 @@ class StringOutputHandler(OutputHandler):
         :param t_walltime: Total walltime for translation.
         """
         self.stream.write("%s\n" % t_output.translation)
+        self.stream.flush()
+
+
+class StringWithScoreOutputHandler(OutputHandler):
+    """
+    Output handler to write translation score and translation to a stream. The score and translation
+    string are tab-delimited.
+
+    :param stream: Stream to write translations to (e.g. sys.stdout).
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def handle(self,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
+               t_walltime: float = 0.):
+        """
+        :param t_input: Translator input.
+        :param t_output: Translator output.
+        :param t_walltime: Total walltime for translation.
+        """
+        self.stream.write("{:.3f}\t{}\n".format(t_output.score, t_output.translation))
         self.stream.flush()
 
 
@@ -107,8 +133,8 @@ class StringWithAlignmentsOutputHandler(StringOutputHandler):
         self.threshold = threshold
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -145,8 +171,8 @@ class StringWithAlignmentMatrixOutputHandler(StringOutputHandler):
         super().__init__(stream)
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -178,8 +204,8 @@ class BenchmarkOutputHandler(StringOutputHandler):
     """
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -206,8 +232,8 @@ class AlignPlotHandler(OutputHandler):
         self.plot_prefix = plot_prefix
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -231,8 +257,8 @@ class AlignTextHandler(OutputHandler):
         self.threshold = threshold
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.

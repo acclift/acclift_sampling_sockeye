@@ -13,6 +13,7 @@ python:
   - "3.6"
 
 install:
+  - sudo apt-get -y update && sudo apt-get install -y libgfortran3
   - pip install -r requirements.txt
   - pip install -r requirements.dev.txt
   - pip install -r requirements.docs.txt
@@ -24,4 +25,4 @@ script:
   - pylint --rcfile=pylintrc test -E
   - mypy --ignore-missing-imports --follow-imports=silent @typechecked-files
   - check-manifest --ignore sockeye/git_version.py
-#  - python -m pytest test/system
+  #- python -m pytest test/system

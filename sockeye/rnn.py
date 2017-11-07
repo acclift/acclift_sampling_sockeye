@@ -222,6 +222,7 @@ class LayerNormLSTMCell(mx.rnn.LSTMCell):
                                     num_hidden=self._num_hidden * 4,
                                     name='%sh2h' % name)
         gates = self._iN.normalize(i2h) + self._hN.normalize(self._shape_fix + h2h)
+        # pylint: disable=unbalanced-tuple-unpacking
         in_gate, forget_gate, in_transform, out_gate = mx.sym.split(gates,
                                                                     num_outputs=4,
                                                                     axis=1,
@@ -283,6 +284,7 @@ class LayerNormPerGateLSTMCell(mx.rnn.LSTMCell):
                                     num_hidden=self._num_hidden * 4,
                                     name='%sh2h' % name)
         gates = i2h + h2h
+        # pylint: disable=unbalanced-tuple-unpacking
         in_gate, forget_gate, in_transform, out_gate = mx.sym.split(
             gates, num_outputs=4, name="%sslice" % name)
 
@@ -406,6 +408,7 @@ class LayerNormGRUCell(mx.rnn.GRUCell):
         i2h = self._iN.normalize(i2h)
         h2h = self._hN.normalize(self._shape_fix + h2h)
 
+        # pylint: disable=unbalanced-tuple-unpacking
         i2h_r, i2h_z, i2h = mx.sym.split(i2h, num_outputs=3, name="%s_i2h_slice" % name)
         h2h_r, h2h_z, h2h = mx.sym.split(h2h, num_outputs=3, name="%s_h2h_slice" % name)
 
@@ -467,6 +470,7 @@ class LayerNormPerGateGRUCell(mx.rnn.GRUCell):
                                     num_hidden=self._num_hidden * 3,
                                     name="%s_h2h" % name)
 
+        # pylint: disable=unbalanced-tuple-unpacking
         i2h_r, i2h_z, i2h = mx.sym.split(i2h, num_outputs=3, name="%s_i2h_slice" % name)
         h2h_r, h2h_z, h2h = mx.sym.split(h2h, num_outputs=3, name="%s_h2h_slice" % name)
 
@@ -506,12 +510,12 @@ class VariationalDropoutCell(mx.rnn.ModifierCell):
     def __call__(self, inputs, states):
         if self.dropout_inputs > 0:
             if self.mask_inputs is None:
-                self.mask_inputs = mx.sym.Dropout(data=inputs, p=self.dropout_inputs, ) != 0
+                self.mask_inputs = mx.sym.Dropout(data=mx.sym.ones_like(inputs), p=self.dropout_inputs)
             inputs = inputs * self.mask_inputs
 
         if self.dropout_states > 0:
             if self.mask_states is None:
-                self.mask_states = mx.sym.Dropout(data=states[0], p=self.dropout_states) != 0
+                self.mask_states = mx.sym.Dropout(data=mx.sym.ones_like(states[0]), p=self.dropout_states)
             states[0] = states[0] * self.mask_states
 
         output, states = self.base_cell(inputs, states)

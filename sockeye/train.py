@@ -18,20 +18,18 @@ import argparse
 import json
 import os
 import pickle
-import random
 import shutil
 import sys
 from contextlib import ExitStack
 from typing import Optional, Dict, List, Tuple
 
 import mxnet as mx
-import numpy as np
 
 from sockeye.config import Config
 from sockeye.log import setup_main_logger
 from sockeye.utils import check_condition
 from . import arguments
-from . import attention
+from . import rnn_attention
 from . import constants as C
 from . import coverage
 from . import data_io
@@ -43,11 +41,11 @@ from . import loss
 from . import lr_scheduler
 from . import model
 from . import rnn
+from . import convolution
 from . import training
 from . import transformer
 from . import utils
 from . import vocab
-
 
 # Temporary logger, the real one (logging to a file probably, will be created in the main function)
 logger = setup_main_logger(__name__, file_logging=False, console=True)
@@ -163,6 +161,10 @@ def determine_context(args: argparse.Namespace, exit_stack: ExitStack) -> List[m
             context = utils.expand_requested_device_ids(args.device_ids)
         else:
             context = exit_stack.enter_context(utils.acquire_gpus(args.device_ids, lock_dir=args.lock_dir))
+        if args.batch_type == C.BATCH_TYPE_SENTENCE:
+            check_condition(args.batch_size % len(context) == 0, "When using multiple devices the batch size must be "
+                                                                 "divisible by the number of devices. Choose a batch "
+                                                                 "size that is a multiple of %d." % len(context))
         logger.info("Device(s): GPU %s", context)
         context = [mx.gpu(gpu_id) for gpu_id in context]
     return context
@@ -236,7 +238,8 @@ def create_data_iters(args: argparse.Namespace,
                                            max_seq_len_source=max_seq_len_source,
                                            max_seq_len_target=max_seq_len_target,
                                            bucketing=not args.no_bucketing,
-                                           bucket_width=args.bucket_width)
+                                           bucket_width=args.bucket_width,
+                                           sequence_limit=args.limit)
 
 
 def create_lr_scheduler(args: argparse.Namespace, resume_training: bool,
@@ -266,16 +269,19 @@ def create_lr_scheduler(args: argparse.Namespace, resume_training: bool,
 
 
 def create_encoder_config(args: argparse.Namespace, vocab_source_size: int,
-                          config_conv: Optional[encoder.ConvolutionalEmbeddingConfig]) -> Config:
+                          config_conv: Optional[encoder.ConvolutionalEmbeddingConfig]) -> Tuple[Config, int]:
     """
     Create the encoder config.
 
     :param args: Arguments as returned by argparse.
     :param vocab_source_size: The source vocabulary.
     :param config_conv: The config for the convolutional encoder (optional).
-    :return: The encoder config.
+    :return: The encoder config and the number of hidden units of the encoder.
     """
     encoder_num_layers, _ = args.num_layers
+    max_seq_len_source, max_seq_len_target = args.max_seq_len
+    num_embed_source, _ = args.num_embed
+    encoder_embed_dropout, _ = args.embed_dropout
     config_encoder = None  # type: Optional[Config]
 
     if args.encoder in (C.TRANSFORMER_TYPE, C.TRANSFORMER_WITH_CONV_EMBED_TYPE):
@@ -287,17 +293,35 @@ def create_encoder_config(args: argparse.Namespace, vocab_source_size: int,
             feed_forward_num_hidden=args.transformer_feed_forward_num_hidden,
             num_layers=encoder_num_layers,
             vocab_size=vocab_source_size,
+            dropout_embed=encoder_embed_dropout,
             dropout_attention=args.transformer_dropout_attention,
             dropout_relu=args.transformer_dropout_relu,
             dropout_prepost=args.transformer_dropout_prepost,
             weight_tying=args.weight_tying and C.WEIGHT_TYING_SRC in args.weight_tying_type,
-            positional_encodings=not args.transformer_no_positional_encodings,
+            weight_normalization=False,
+            positional_embedding_type=args.transformer_positional_embedding_type,
             preprocess_sequence=encoder_transformer_preprocess,
             postprocess_sequence=encoder_transformer_postprocess,
+            max_seq_len_source=max_seq_len_source,
+            max_seq_len_target=max_seq_len_target,
             conv_config=config_conv)
+        encoder_num_hidden = args.transformer_model_size
+    elif args.encoder == C.CONVOLUTION_TYPE:
+        cnn_kernel_width_encoder, _ = args.cnn_kernel_width
+        cnn_config = convolution.ConvolutionConfig(kernel_width=cnn_kernel_width_encoder,
+                                                   num_hidden=args.cnn_num_hidden,
+                                                   act_type=args.cnn_activation_type,
+                                                   weight_normalization=args.weight_normalization)
+        config_encoder = encoder.ConvolutionalEncoderConfig(vocab_size=vocab_source_size,
+                                                            num_embed=num_embed_source,
+                                                            embed_dropout=encoder_embed_dropout,
+                                                            max_seq_len_source=max_seq_len_source,
+                                                            cnn_config=cnn_config,
+                                                            num_layers=encoder_num_layers,
+                                                            positional_embedding_type=args.cnn_positional_embedding_type)
+
+        encoder_num_hidden = args.cnn_num_hidden
     else:
-        num_embed_source, _ = args.num_embed
-        encoder_embed_dropout, _ = args.embed_dropout
         encoder_rnn_dropout_inputs, _ = args.rnn_dropout_inputs
         encoder_rnn_dropout_states, _ = args.rnn_dropout_states
         encoder_rnn_dropout_recurrent, _ = args.rnn_dropout_recurrent
@@ -316,11 +340,12 @@ def create_encoder_config(args: argparse.Namespace, vocab_source_size: int,
                                      forget_bias=args.rnn_forget_bias),
             conv_config=config_conv,
             reverse_input=args.rnn_encoder_reverse_input)
+        encoder_num_hidden = args.rnn_num_hidden
 
-    return config_encoder
+    return config_encoder, encoder_num_hidden
 
 
-def create_decoder_config(args: argparse.Namespace, vocab_target_size: int) -> Config:
+def create_decoder_config(args: argparse.Namespace, vocab_target_size: int, encoder_num_hidden: int) -> Config:
     """
     Create the config for the decoder.
 
@@ -329,9 +354,13 @@ def create_decoder_config(args: argparse.Namespace, vocab_target_size: int) -> C
     :return: The config for the decoder.
     """
     _, decoder_num_layers = args.num_layers
+    max_seq_len_source, max_seq_len_target = args.max_seq_len
+    _, num_embed_target = args.num_embed
+    _, decoder_embed_dropout = args.embed_dropout
 
     decoder_weight_tying = args.weight_tying and C.WEIGHT_TYING_TRG in args.weight_tying_type \
-        and C.WEIGHT_TYING_SOFTMAX in args.weight_tying_type
+                           and C.WEIGHT_TYING_SOFTMAX in args.weight_tying_type
+
     config_decoder = None  # type: Optional[Config]
 
     if args.decoder == C.TRANSFORMER_TYPE:
@@ -343,33 +372,53 @@ def create_decoder_config(args: argparse.Namespace, vocab_target_size: int) -> C
             feed_forward_num_hidden=args.transformer_feed_forward_num_hidden,
             num_layers=decoder_num_layers,
             vocab_size=vocab_target_size,
+            dropout_embed=decoder_embed_dropout,
             dropout_attention=args.transformer_dropout_attention,
             dropout_relu=args.transformer_dropout_relu,
             dropout_prepost=args.transformer_dropout_prepost,
             weight_tying=decoder_weight_tying,
-            positional_encodings=not args.transformer_no_positional_encodings,
+            weight_normalization=args.weight_normalization,
+            positional_embedding_type=args.transformer_positional_embedding_type,
             preprocess_sequence=decoder_transformer_preprocess,
             postprocess_sequence=decoder_transformer_postprocess,
+            max_seq_len_source=max_seq_len_source,
+            max_seq_len_target=max_seq_len_target,
             conv_config=None)
 
-    else:
-        attention_num_hidden = args.rnn_num_hidden if not args.attention_num_hidden else args.attention_num_hidden
-        config_coverage = None
-        if args.attention_type == C.ATT_COV:
-            config_coverage = coverage.CoverageConfig(type=args.attention_coverage_type,
-                                                      num_hidden=args.attention_coverage_num_hidden,
-                                                      layer_normalization=args.layer_normalization)
-        config_attention = attention.AttentionConfig(type=args.attention_type,
-                                                     num_hidden=attention_num_hidden,
-                                                     input_previous_word=args.attention_use_prev_word,
-                                                     rnn_num_hidden=args.rnn_num_hidden,
-                                                     layer_normalization=args.layer_normalization,
-                                                     config_coverage=config_coverage,
-                                                     num_heads=args.attention_mhdot_heads)
+    elif args.decoder == C.CONVOLUTION_TYPE:
+        _, cnn_kernel_width_decoder = args.cnn_kernel_width
+        convolution_config = convolution.ConvolutionConfig(kernel_width=cnn_kernel_width_decoder,
+                                                           num_hidden=args.cnn_num_hidden,
+                                                           act_type=args.cnn_activation_type,
+                                                           weight_normalization=args.weight_normalization)
+        config_decoder = decoder.ConvolutionalDecoderConfig(cnn_config=convolution_config,
+                                                            vocab_size=vocab_target_size,
+                                                            max_seq_len_target=max_seq_len_target,
+                                                            num_embed=num_embed_target,
+                                                            encoder_num_hidden=encoder_num_hidden,
+                                                            num_layers=decoder_num_layers,
+                                                            positional_embedding_type=args.cnn_positional_embedding_type,
+                                                            weight_tying=decoder_weight_tying,
+                                                            embed_dropout=decoder_embed_dropout,
+                                                            weight_normalization=args.weight_normalization,
+                                                            hidden_dropout=args.cnn_hidden_dropout)
 
-        max_seq_len_source, _ = args.max_seq_len
-        _, num_embed_target = args.num_embed
-        _, decoder_embed_dropout = args.embed_dropout
+    else:
+        rnn_attention_num_hidden = args.rnn_num_hidden if args.rnn_attention_num_hidden is None else args.rnn_attention_num_hidden
+        config_coverage = None
+        if args.rnn_attention_type == C.ATT_COV:
+            config_coverage = coverage.CoverageConfig(type=args.rnn_attention_coverage_type,
+                                                      num_hidden=args.rnn_attention_coverage_num_hidden,
+                                                      layer_normalization=args.layer_normalization)
+        config_attention = rnn_attention.AttentionConfig(type=args.rnn_attention_type,
+                                                         num_hidden=rnn_attention_num_hidden,
+                                                         input_previous_word=args.rnn_attention_use_prev_word,
+                                                         source_num_hidden=encoder_num_hidden,
+                                                         query_num_hidden=args.rnn_num_hidden,
+                                                         layer_normalization=args.layer_normalization,
+                                                         config_coverage=config_coverage,
+                                                         num_heads=args.rnn_attention_mhdot_heads)
+
         _, decoder_rnn_dropout_inputs = args.rnn_dropout_inputs
         _, decoder_rnn_dropout_states = args.rnn_dropout_states
         _, decoder_rnn_dropout_recurrent = args.rnn_dropout_recurrent
@@ -394,9 +443,10 @@ def create_decoder_config(args: argparse.Namespace, vocab_target_size: int) -> C
             state_init=args.rnn_decoder_state_init,
             context_gating=args.rnn_context_gating,
             layer_normalization=args.layer_normalization,
-            attention_in_upper_layers=args.attention_in_upper_layers,
             scheduled_sampling_type=args.scheduled_sampling_type,
-            scheduled_sampling_params=args.scheduled_sampling_params)
+            scheduled_sampling_params=args.scheduled_sampling_params,
+            attention_in_upper_layers=args.rnn_attention_in_upper_layers,
+            weight_normalization=args.weight_normalization)
 
     return config_decoder
 
@@ -447,13 +497,13 @@ def create_model_config(args: argparse.Namespace,
                                                            num_highway_layers=args.conv_embed_num_highway_layers,
                                                            dropout=args.conv_embed_dropout)
 
-    config_encoder = create_encoder_config(args, vocab_source_size, config_conv)
-    config_decoder = create_decoder_config(args, vocab_target_size)
+    config_encoder, encoder_num_hidden = create_encoder_config(args, vocab_source_size, config_conv)
+    config_decoder = create_decoder_config(args, vocab_target_size, encoder_num_hidden)
 
-    config_loss = loss.LossConfig(type=args.loss,
+    config_loss = loss.LossConfig(name=args.loss,
                                   vocab_size=vocab_target_size,
-                                  normalize=args.normalize_loss,
-                                  smoothed_cross_entropy_alpha=args.smoothed_cross_entropy_alpha)
+                                  normalization_type=args.loss_normalization_type,
+                                  label_smoothing=args.label_smoothing)
 
     model_config = model.ModelConfig(config_data=config_data,
                                      max_seq_len_source=max_seq_len_source,
@@ -468,7 +518,7 @@ def create_model_config(args: argparse.Namespace,
                                      weight_tying=args.weight_tying,
                                      scheduled_sampling_type=args.scheduled_sampling_type,
                                      scheduled_sampling_params=args.scheduled_sampling_params,
-                                     weight_tying_type=args.weight_tying_type if args.weight_tying else None)
+                                     weight_tying_type=args.weight_tying_type if args.weight_tying else None,)
     return model_config
 
 
@@ -513,13 +563,13 @@ def create_training_model(model_config: model.ModelConfig,
     return training_model
 
 
-def define_optimizer(args, lr_scheduler_instance) -> Tuple[str, Dict]:
+def define_optimizer(args, lr_scheduler_instance) -> Tuple[str, Dict, str]:
     """
     Defines the optimizer to use and its parameters.
 
     :param args: Arguments as returned by argparse.
     :param lr_scheduler: The learning rate scheduler.
-    :return: The optimizer type and its parameters.
+    :return: The optimizer type and its parameters as well as the kvstore.
     """
     optimizer = args.optimizer
     optimizer_params = {'wd': args.weight_decay,
@@ -531,17 +581,20 @@ def define_optimizer(args, lr_scheduler_instance) -> Tuple[str, Dict]:
         optimizer_params["clip_gradient"] = clip_gradient
     if args.momentum is not None:
         optimizer_params["momentum"] = args.momentum
-    if args.normalize_loss:
-        # When normalize_loss is turned on we normalize by the number of non-PAD symbols in a batch which implicitly
-        # already contains the number of sentences and therefore we need to disable rescale_grad.
+    if args.loss_normalization_type == C.LOSS_NORM_VALID:
+        # When we normalize by the number of non-PAD symbols in a batch we need to disable rescale_grad.
         optimizer_params["rescale_grad"] = 1.0
-    else:
+    elif args.loss_normalization_type == C.LOSS_NORM_BATCH:
         # Making MXNet module API's default scaling factor explicit
         optimizer_params["rescale_grad"] = 1.0 / args.batch_size
+    # Manually specified params
+    if args.optimizer_params:
+        optimizer_params.update(args.optimizer_params)
     logger.info("Optimizer: %s", optimizer)
     logger.info("Optimizer Parameters: %s", optimizer_params)
+    logger.info("kvstore: %s", args.kvstore)
 
-    return optimizer, optimizer_params
+    return optimizer, optimizer_params, args.kvstore
 
 
 def main():
@@ -583,20 +636,31 @@ def main():
         lexicon_array = lexicon.initialize_lexicon(args.lexical_bias,
                                                    vocab_source, vocab_target) if args.lexical_bias else None
 
-        weight_initializer = initializer.get_initializer(args.weight_init, args.weight_init_scale,
-                                                         args.rnn_h2h_init, lexicon=lexicon_array)
+        weight_initializer = initializer.get_initializer(
+            default_init_type=args.weight_init,
+            default_init_scale=args.weight_init_scale,
+            default_init_xavier_factor_type=args.weight_init_xavier_factor_type,
+            embed_init_type=args.embed_weight_init,
+            embed_init_sigma=vocab_source_size ** -0.5,  # TODO
+            rnn_init_type=args.rnn_h2h_init,
+            lexicon=lexicon_array)
 
-        optimizer, optimizer_params = define_optimizer(args, lr_scheduler_instance)
+        optimizer, optimizer_params, kvstore = define_optimizer(args, lr_scheduler_instance)
 
         # Handle options that override training settings
         max_updates = args.max_updates
         max_num_checkpoint_not_improved = args.max_num_checkpoint_not_improved
         min_num_epochs = args.min_num_epochs
+        max_num_epochs = args.max_num_epochs
+        if min_num_epochs is not None and max_num_epochs is not None:
+            check_condition(min_num_epochs <= max_num_epochs,
+                            "Minimum number of epochs must be smaller than maximum number of epochs")
         # Fixed training schedule always runs for a set number of updates
         if args.learning_rate_schedule:
             max_updates = sum(num_updates for (_, num_updates) in args.learning_rate_schedule)
             max_num_checkpoint_not_improved = -1
-            min_num_epochs = 0
+            min_num_epochs = None
+            max_num_epochs = None
 
         monitor_bleu = args.monitor_bleu
         # Turn on BLEU monitoring when the optimized metric is BLEU and it hasn't been enabled yet
@@ -615,12 +679,16 @@ def main():
                            checkpoint_frequency=args.checkpoint_frequency,
                            optimizer=optimizer, optimizer_params=optimizer_params,
                            optimized_metric=args.optimized_metric,
+                           kvstore=kvstore,
                            max_num_not_improved=max_num_checkpoint_not_improved,
                            min_num_epochs=min_num_epochs,
+                           max_num_epochs=max_num_epochs,
                            monitor_bleu=monitor_bleu,
                            use_tensorboard=args.use_tensorboard,
                            mxmonitor_pattern=args.monitor_pattern,
-                           mxmonitor_stat_func=args.monitor_stat_func)
+                           mxmonitor_stat_func=args.monitor_stat_func,
+                           lr_decay_param_reset=args.learning_rate_decay_param_reset,
+                           lr_decay_opt_states_reset=args.learning_rate_decay_optimizer_states_reset)
 
 
 if __name__ == "__main__":

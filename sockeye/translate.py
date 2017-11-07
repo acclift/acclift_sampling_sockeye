@@ -14,9 +14,11 @@
 """
 Translation CLI.
 """
+import itertools
 import argparse
 import sys
 import time
+from math import ceil
 from contextlib import ExitStack
 from typing import Optional, Iterable, Tuple
 
@@ -30,7 +32,7 @@ import sockeye.inference
 import sockeye.output_handler
 from sockeye.log import setup_main_logger
 from sockeye.utils import acquire_gpus, get_num_gpus, log_basic_info
-from sockeye.utils import check_condition
+from sockeye.utils import check_condition, grouper
 
 
 logger = setup_main_logger(__name__, file_logging=False)
@@ -67,60 +69,62 @@ def main():
                                                   *sockeye.inference.load_models(context,
                                                                                  args.max_input_len,
                                                                                  args.beam_size,
+                                                                                 args.batch_size,
                                                                                  args.models,
                                                                                  args.checkpoints,
                                                                                  args.softmax_temperature,
                                                                                  args.max_output_length_num_stds))
-        read_and_translate(translator, output_handler, args.input)
+        read_and_translate(translator, output_handler, args.chunk_size, args.input)
 
 
 def read_and_translate(translator: sockeye.inference.Translator, output_handler: sockeye.output_handler.OutputHandler,
-                       source: Optional[str] = None) -> None:
+                       chunk_size: int, source: Optional[str] = None) -> None:
     """
     Reads from either a file or stdin and translates each line, calling the output_handler with the result.
 
     :param output_handler: Handler that will write output to a stream.
     :param translator: Translator that will translate each line of input.
+    :param chunk_size: The size of the portion to read at a time from the input.
     :param source: Path to file which will be translated line-by-line if included, if none use stdin.
     """
-
     source_data = sys.stdin if source is None else sockeye.data_io.smart_open(source)
 
     logger.info("Translating...")
 
-    i, total_time = translate_lines(output_handler, source_data, translator)
+    total_time, total_lines = 0.0, 0
+    for chunk in grouper(source_data, chunk_size):
+        chunk_time = translate(output_handler, chunk, translator, total_lines)
+        total_lines += len(chunk) 
+        total_time += chunk_time
 
-    if i != 0:
-        logger.info("Processed %d lines. Total time: %.4f sec/sent: %.4f sent/sec: %.4f", i, total_time,
-                    total_time / i, i / total_time)
+    if total_lines != 0:
+        logger.info("Processed %d lines in %d batches. Total time: %.4f, sec/sent: %.4f, sent/sec: %.4f",
+                    total_lines, ceil(total_lines / translator.batch_size), total_time,
+                    total_time / total_lines, total_lines / total_time)
     else:
         logger.info("Processed 0 lines.")
 
 
-def translate_lines(output_handler: sockeye.output_handler.OutputHandler, source_data: Iterable[str],
-                    translator: sockeye.inference.Translator) -> Tuple[int, float]:
+def translate(output_handler: sockeye.output_handler.OutputHandler, source_data: Iterable[str],
+                    translator: sockeye.inference.Translator, chunk_id: int = 0) -> float:
     """
-    Translates each line from source_data, calling output handler for each result.
+    Translates each line from source_data, calling output handler after translating a batch.
 
     :param output_handler: A handler that will be called once with the output of each translation.
     :param source_data: A enumerable list of source sentences that will be translated.
     :param translator: The translator that will be used for each line of input.
-    :return: The number of lines translated, and the total time taken.
+    :param chunk_id: Global id of the chunk.
+    :return: Total time taken.
     """
 
-    i = 0
-    total_time = 0.0
-    for i, line in enumerate(source_data, 1):
-        tic = time.time()
-        trans_input = translator.make_input(i, line)
-        logger.debug(" IN: %s", trans_input)
-        trans_output = translator.translate(trans_input)
-        trans_wall_time = time.time() - tic
-        total_time += trans_wall_time
-        logger.debug("OUT: %s", trans_output)
-        logger.debug("OUT: time=%.2f", trans_wall_time)
-        output_handler.handle(trans_input, trans_output, trans_wall_time)
-    return i, total_time
+    tic = time.time()
+    trans_inputs = [translator.make_input(i, line) for i, line in enumerate(source_data, chunk_id + 1)]
+    trans_outputs = translator.translate(trans_inputs)
+    total_time = time.time() - tic
+    batch_time = total_time / len(trans_inputs)
+    for trans_input, trans_output in zip(trans_inputs, trans_outputs):
+        output_handler.handle(trans_input, trans_output, batch_time)
+    return total_time
 
 
 def _setup_context(args, exit_stack):

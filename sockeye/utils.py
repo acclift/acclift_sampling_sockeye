@@ -25,8 +25,9 @@ import shutil
 import subprocess
 import sys
 import time
+import itertools
 from contextlib import contextmanager, ExitStack
-from typing import Mapping, NamedTuple, Any, List, Iterator, Set, TextIO, Tuple, Dict, Optional
+from typing import Mapping, NamedTuple, Any, List, Iterator, Iterable, Set, TextIO, Tuple, Dict, Optional
 
 import mxnet as mx
 import numpy as np
@@ -314,9 +315,16 @@ def smallest_k_mx(matrix: mx.nd.NDArray, k: int,
     if only_first_row:
         matrix = mx.nd.reshape(matrix[0], shape=(1, -1))
 
+    # pylint: disable=unbalanced-tuple-unpacking
     values, indices = mx.nd.topk(matrix, axis=None, k=k, ret_typ='both', is_ascend=True)
 
     return np.unravel_index(indices.astype(np.int32).asnumpy(), matrix.shape), values
+
+
+def chunks(some_list: List, n: int) -> Iterable[List]:
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(some_list), n):
+        yield some_list[i:i + n]
 
 
 def plot_attention(attention_matrix: np.ndarray, source_tokens: List[str], target_tokens: List[str], filename: str):
@@ -705,3 +713,82 @@ def get_validation_metric_points(model_path: str, metric: str):
     metrics_path = os.path.join(model_path, C.METRICS_NAME)
     data = read_metrics_file(metrics_path)
     return [(d['%s-val' % metric], cp) for cp, d in enumerate(data, 1)]
+
+
+class PrintValue(mx.operator.CustomOp):
+    """
+    Custom operator that takes a symbol, prints its value to stdout and
+    propagates the value unchanged. Useful for debugging.
+
+    Use it as:
+    my_sym = mx.sym.Custom(op_type="PrintValue", data=my_sym, print_name="My symbol")
+
+    Additionally you can use the optional arguments 'use_logger=True' for using
+    the system logger and 'print_grad=True' for printing information about the
+    gradient (out_grad, i.e. "upper part" of the graph).
+    """
+    def __init__(self, print_name, print_grad: str, use_logger: str):
+        super().__init__()
+        self.print_name = print_name
+        # Note that all the parameters are serialized as strings
+        self.print_grad = (print_grad == "True")
+        self.use_logger = (use_logger == "True")
+
+    def __print_nd__(self, nd: mx.nd.array, label: str):
+        intro = "%s %s - shape %s" % (label, self.print_name, str(nd.shape))
+        if self.use_logger:
+            logger.info(intro)
+            logger.info(str(nd.asnumpy()))
+        else:
+            print(">>>>> ", intro)
+            print(nd.asnumpy())
+
+    def forward(self, is_train, req, in_data, out_data, aux):
+        self.__print_nd__(in_data[0], "Symbol")
+        self.assign(out_data[0], req[0], in_data[0])
+
+    def backward(self, req, out_grad, in_data, out_data, in_grad, aux):
+        if self.print_grad:
+            self.__print_nd__(out_grad[0], "Grad")
+        self.assign(in_grad[0], req[0], out_grad[0])
+
+
+@mx.operator.register("PrintValue")
+class PrintValueProp(mx.operator.CustomOpProp):
+    def __init__(self, print_name: str, print_grad: bool = False, use_logger: bool = False):
+        super().__init__(need_top_grad=True)
+        self.print_name = print_name
+        self.print_grad = print_grad
+        self.use_logger = use_logger
+
+    def list_arguments(self):
+        return ["data"]
+
+    def list_outputs(self):
+        return ["output"]
+
+    def infer_shape(self, in_shape):
+        return in_shape, in_shape, []
+
+    def infer_type(self, in_type):
+        return in_type, in_type, []
+
+    def create_operator(self, ctx, shapes, dtypes):
+        return PrintValue(self.print_name,
+                          print_grad=self.print_grad,
+                          use_logger=self.use_logger)
+
+
+def grouper(iterable: Iterable, size: int) -> Iterable:
+    """
+    Collect data into fixed-length chunks or blocks without discarding underfilled chunks or padding them.
+
+    :param iterable: A sequence of inputs.
+    :return: Sequence of chunks.
+    """
+    it = iter(iterable)
+    while True:
+        chunk = list(itertools.islice(it, size))
+        if not chunk:
+            return
+        yield chunk
