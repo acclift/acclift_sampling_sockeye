@@ -760,12 +760,13 @@ class RecurrentDecoder(Decoder):
                                                 attention_state,
                                                 seq_idx)
 
-            # (batch_size, target_vocab_size)
-            logit = mx.sym.FullyConnected(data=state.hidden, num_hidden=self.config.vocab_size,
-                                          weight=self.cls_w, bias=self.cls_b, name=C.LOGITS_NAME)
+            # logits: (batch_size, target_vocab_size)
+            logits = self.output_layer(state.hidden)
+            #logit = mx.sym.FullyConnected(data=state.hidden, num_hidden=self.config.vocab_size,
+            #                              weight=self.cls_w, bias=self.cls_b, name=C.LOGITS_NAME)
             #logit = mx.sym.Custom(op_type="PrintValue", data=logit, print_name="logit in iterative decode")
 
-            prob = mx.sym.softmax(logit)
+            prob = mx.sym.softmax(logits)
 
             sampled_words = mx.sym.sample_multinomial(prob)
             sampled_words = mx.sym.BlockGrad(sampled_words)
