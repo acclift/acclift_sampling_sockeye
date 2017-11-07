@@ -201,7 +201,7 @@ class TrainingModel(model.SockeyeModel):
             if self.config.config_decoder.scheduled_sampling_type is not None:
                 # scheduled sampling
 
-                """
+                #"""
                 ###### HERE'S WHERE WE PULL RUNNING SAMPLING OUT OF THE DECODER #####
                 threshold = self._get_sampling_threshold()
                 probs_all = []
@@ -243,7 +243,8 @@ class TrainingModel(model.SockeyeModel):
                 ####### THIS IS HOW WE DO IT WHEN IT'S COUPLED WITHIN THE DECODER (TO CHANGE)
                 probs, threshold = self.decoder.iterative_decode(source_encoded, source_encoded_length, source_encoded_seq_len,
                                                                 target, target_seq_len, source_lexicon)
-
+                
+                """
                 ###### BELOW SHOULDN'T CHANGE #####
 
                 # one-hot representation of gold targets for manually computing cross-entropy
