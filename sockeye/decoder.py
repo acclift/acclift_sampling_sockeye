@@ -654,9 +654,8 @@ class RecurrentDecoder(Decoder):
                         source_encoded_max_length: int,
                         target: mx.sym.Symbol,
                         target_max_length: int,
-                        updates: mx.sym.Variable,
                         source_lexicon: Optional[mx.sym.Symbol] = None) -> mx.sym.Symbol:
-        # TODO (acclift) see if we can factor this into a loop that reuses decode_step, not separate function
+        # TODO (acclift) factor this into a loop that uses decode_step, from sym_gen
 
         """
                 Decodes given a known target sequence and returns logits
@@ -702,7 +701,6 @@ class RecurrentDecoder(Decoder):
 
         for seq_idx in range(target_max_length):
 
-
             if seq_idx == 0:
                 decoder_current_word = target[seq_idx]
             else:
@@ -725,16 +723,19 @@ class RecurrentDecoder(Decoder):
             # (batch_size, target_vocab_size)
             logit = mx.sym.FullyConnected(data=state.hidden, num_hidden=self.config.vocab_size,
                                           weight=self.cls_w, bias=self.cls_b, name=C.LOGITS_NAME)
+            #logit = mx.sym.Custom(op_type="PrintValue", data=logit, print_name="logit in iterative decode")
 
             prob = mx.sym.softmax(logit)
 
             sampled_words = mx.sym.sample_multinomial(prob)
             sampled_words = mx.sym.BlockGrad(sampled_words)
+            #prob = mx.sym.Custom(op_type="PrintValue", data=prob, print_name="prob in iterative decode")
 
             probs_all.append(prob)
 
         # probs: (batch_size, target_seq_len, target_vocab_size)
         probs = mx.sym.concat(*probs_all, dim=1, name='probs')
+        #probs = mx.sym.Custom(op_type="PrintValue", data=probs, print_name="Probs in iterative decode")
         # probs: (batch_size * target_seq_len, target_vocab_size)
         probs = mx.sym.reshape(data=probs, shape=(-1, self.config.vocab_size))
 

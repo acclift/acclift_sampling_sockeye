@@ -466,6 +466,8 @@ def create_model_config(args: argparse.Namespace,
                                      lexical_bias=args.lexical_bias,
                                      learn_lexical_bias=args.learn_lexical_bias,
                                      weight_tying=args.weight_tying,
+                                     scheduled_sampling_type=args.scheduled_sampling_type,
+                                     scheduled_sampling_params=args.scheduled_sampling_params,
                                      weight_tying_type=args.weight_tying_type if args.weight_tying else None)
     return model_config
 

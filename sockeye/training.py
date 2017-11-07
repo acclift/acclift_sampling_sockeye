@@ -37,6 +37,55 @@ from . import utils
 
 logger = logging.getLogger(__name__)
 
+def check_scheduled_sampling_params(scheduled_sampling_type: str, scheduled_sampling_params: List[float]) -> None:
+    if scheduled_sampling_type == 'inv-sigmoid-decay':
+        assert len(scheduled_sampling_params) == 2, \
+            ('The inverse sigmoid decaying option for scheduled sampling requires 2 parameters,'
+             ' but given {}.').format(len(scheduled_sampling_params))
+
+        k, lower_bound = scheduled_sampling_params
+        assert k >= 1, 'Offset should be greater than or equal to 1.'
+        assert lower_bound >= 0 and lower_bound < 1, 'Lower bound should be 0 or greater and less than 1.'
+
+    elif scheduled_sampling_type == 'exponential-decay':
+        assert len(scheduled_sampling_params) == 1, \
+            ('The exponential decaying option for scheduled sampling requires 1 parameter,'
+             ' but given {}.').format(len(scheduled_sampling_params))
+
+        k = scheduled_sampling_params[0]
+        assert k < 1, 'Offset for the exponential decay should be less than 1.'
+
+    elif scheduled_sampling_type == 'linear-decay':
+        assert len(scheduled_sampling_params) == 3, \
+            ('The linear decaying option for scheduled sampling requires 3 parameters,'
+             ' but given {}').format(len(scheduled_sampling_params))
+
+        k, epsilon, slope = scheduled_sampling_params
+        assert k <= 1, 'Offset for the linear decay should be less than 1.'
+        assert epsilon >= 0, 'Epsilon for the linear decay should be greater than or equal to 0.'
+
+def get_sampling_scheduler(scheduled_sampling_type, scheduled_sampling_params):
+    """
+    Computes the threshold over which we train against model samples rather than gold targets
+    """
+    i = mx.sym.Variable('updates')
+
+    check_scheduled_sampling_params(scheduled_sampling_type, scheduled_sampling_params)
+
+    if scheduled_sampling_type == 'inv-sigmoid-decay':
+        k, lower_bound = scheduled_sampling_params
+        sampling_scheduler = lambda: k / (k + mx.sym.exp(i / k) - 1) * (1 - lower_bound) + lower_bound
+    elif scheduled_sampling_type == 'exponential-decay':
+        k = scheduled_sampling_params[0]
+        sampling_scheduler = lambda: pow(k, i)
+    elif scheduled_sampling_type == 'linear-decay':
+        k, epsilon, slope = scheduled_sampling_params
+        sampling_scheduler = lambda: mx.sym.clip(k - slope * i, epsilon, k)
+    else:
+        sampling_scheduler = lambda: 1
+
+    return sampling_scheduler
+
 
 class _TrainingState:
     """
@@ -83,6 +132,7 @@ class TrainingModel(model.SockeyeModel):
                  lr_scheduler,
                  state_names: Optional[List[str]]) -> None:
         super().__init__(config)
+        self._get_sampling_threshold = self._get_sampling_scheduler()
         self.context = context
         self.lr_scheduler = lr_scheduler
         self.bucketing = bucketing
@@ -90,6 +140,30 @@ class TrainingModel(model.SockeyeModel):
         self._build_model_components(fused)
         self.module = self._build_module(train_iter)
         self.training_monitor = None  # type: Optional[callback.TrainingMonitor]
+
+    def _get_sampling_scheduler(self):
+        """
+        Computes the threshold over which we train against model samples rather than gold targets
+        """
+        i = mx.sym.Variable('updates')
+
+        check_scheduled_sampling_params(self.config.scheduled_sampling_type, self.config.scheduled_sampling_params)
+
+        if self.config.scheduled_sampling_type == 'inv-sigmoid-decay':
+            k, lower_bound = self.config.scheduled_sampling_params
+            sampling_scheduler = lambda: k / (k + mx.sym.exp(i / k) - 1) * (1 - lower_bound) + lower_bound
+        elif self.config.scheduled_sampling_type == 'exponential-decay':
+            k = self.config.scheduled_sampling_params[0]
+            sampling_scheduler = lambda: pow(k, i)
+        elif self.config.scheduled_sampling_type == 'linear-decay':
+            k, epsilon, slope = scheduled_sampling_params
+            sampling_scheduler = lambda: mx.sym.clip(k - slope * i, epsilon, k)
+        else:
+            print("sampling scheduler is just 1")
+            print("sampling scheduler: %s" % self.config.scheduled_sampling_type)
+            sampling_scheduler = lambda: 1
+
+        return sampling_scheduler
 
     def _build_module(self, train_iter: data_io.ParallelBucketSentenceIter):
         """
@@ -101,6 +175,7 @@ class TrainingModel(model.SockeyeModel):
         target = mx.sym.Variable(C.TARGET_NAME)
         target_length = utils.compute_lengths(target)
         labels = mx.sym.reshape(data=mx.sym.Variable(C.TARGET_LABEL_NAME), shape=(-1,))
+        #labels = mx.sym.Custom(op_type="PrintValue", data=labels, print_name="Labels")
 
         model_loss = loss.get_loss(self.config.config_loss)
 
@@ -120,12 +195,57 @@ class TrainingModel(model.SockeyeModel):
 
             source_lexicon = self.lexicon.lookup(source) if self.lexicon else None
 
+
             if self.config.config_decoder.scheduled_sampling_type is not None:
                 # scheduled sampling
+
+                """
+                ###### HERE'S WHERE WE PULL RUNNING SAMPLING OUT OF THE DECODER #####
+                threshold = self._get_sampling_threshold()
+                probs_all = []
+                # initialize decoder states
+                decoder_states = self.decoder.init_states(source_encoded, source_encoded_length, source_encoded_seq_len)
+                # slice target words
+                # target: target_seq_len * (batch_size)
+                target_seq = mx.sym.split(data=target, num_outputs=target_seq_len, axis=1, squeeze_axis=True)
+                for seq_idx in range(target_seq_len):
+                    if seq_idx == 0:
+                        decoder_current_word = target_seq[seq_idx]
+                    else:
+                        rand_val = mx.sym.random_uniform(low=0, high=1.0, shape=1)[0]
+                        decoder_current_word = mx.sym.where(rand_val < threshold,
+                                                            mx.sym.cast(target_seq[seq_idx], dtype='int32'), sampled_words)
+
+                    logits, attention_probs, next_decoder_states = self.decoder.decode_step(decoder_current_word,
+                                                                                            target_seq_len,
+                                                                                            source_encoded_seq_len,
+                                                                                            *decoder_states)
+                    prob = mx.sym.softmax(logits)
+
+                    sampled_words = mx.sym.sample_multinomial(prob)
+                    sampled_words = mx.sym.BlockGrad(sampled_words)
+                    prob = mx.sym.Custom(op_type="PrintValue", data=prob, print_name="prob in training")
+
+                    probs_all.append(prob)
+
+                    decoder_states = next_decoder_states
+                logger.info("len probs_all: %i", len(probs_all))
+
+                # probs: (batch_size, target_seq_len, target_vocab_size)
+                probs = mx.sym.concat(*probs_all, dim=1, name='probs')
+                # probs: (batch_size * target_seq_len, target_vocab_size)
+                probs = mx.sym.reshape(data=probs, shape=(-1, self.config.vocab_target_size))
+
+
+                """
+                ####### THIS IS HOW WE DO IT WHEN IT'S COUPLED WITHIN THE DECODER (TO CHANGE)
                 probs, threshold = self.decoder.iterative_decode(source_encoded, source_encoded_length, source_encoded_seq_len,
                                                                 target, target_seq_len, source_lexicon)
 
-                # one-hot representation of gold targets for manually computing cross-entropy with model's predicted distribution
+                ###### BELOW SHOULDN'T CHANGE #####
+
+                # one-hot representation of gold targets for manually computing cross-entropy
+                # with model's predicted distribution
                 cross_entropy = mx.sym.one_hot(indices=mx.sym.cast(data=labels, dtype='int32'),
                                                depth=self.config.vocab_target_size)
 
@@ -137,8 +257,9 @@ class TrainingModel(model.SockeyeModel):
                 cross_entropy = mx.sym.sum(data=cross_entropy, axis=1)
 
                 cross_entropy = mx.sym.MakeLoss(cross_entropy, name=C.CROSS_ENTROPY)
-
+                #cross_entropy = mx.sym.Custom(op_type="PrintValue", data=cross_entropy, print_name="cross entropy")
                 probs = mx.sym.BlockGrad(probs, name=C.SOFTMAX_NAME)
+
                 threshold = mx.sym.BlockGrad(threshold)
 
                 outputs = [cross_entropy, probs, threshold]
@@ -240,7 +361,6 @@ class TrainingModel(model.SockeyeModel):
         """
         self.save_version(output_folder)
         self.save_config(output_folder)
-
         self.module.bind(data_shapes=train_iter.provide_data, label_shapes=train_iter.provide_label,
                          for_training=True, force_rebind=True, grad_req='write')
         self.module.symbol.save(os.path.join(output_folder, C.SYMBOL_NAME))
